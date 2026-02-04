@@ -1,334 +1,180 @@
-from flask import Flask, request, redirect, session, send_from_directory
-import sqlite3, os
+# ================== SELVA PANEL – FULL WEBSITE ==================
+# Flask single-file project
+# Features:
+# Intro (5s) – Login – Roles (Owner/Admin/User)
+# Search by last 3 digits – File manager – Numbers by country
+# Telethon script is NOT included (as requested)
+
+from flask import Flask, request, redirect, url_for, session, render_template_string, send_from_directory
+import os
 
 app = Flask(__name__)
-app.secret_key = "SELVA_FULL_PANEL"
+app.secret_key = "SELVA_SECRET_KEY"
 
-UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-DB = "database.db"
+# ================== USERS ==================
+USERS = {
+    "mohaymen": {"password": "mohaymen", "role": "owner"},
+    "selvaaapanell": {"password": "selvaaapanell", "role": "admin"},
+    "selvaaapanelll": {"password": "selvaaapanelll", "role": "admin"},
+}
 
-# ---------------- DATABASE ----------------
-def init_db():
-    con = sqlite3.connect(DB)
-    cur = con.cursor()
+# ================== STORAGE ==================
+BASE_DIR = os.path.dirname(__file__)
+UPLOADS = os.path.join(BASE_DIR, "uploads")
+NUMBERS = os.path.join(BASE_DIR, "numbers")
+os.makedirs(UPLOADS, exist_ok=True)
+os.makedirs(NUMBERS, exist_ok=True)
 
-    cur.execute("""CREATE TABLE IF NOT EXISTS users(
-        id INTEGER PRIMARY KEY,
-        username TEXT UNIQUE,
-        password TEXT,
-        role TEXT)""")
+MESSAGES = []  # example: {"text": "Your OTP is 123", "last3": "123"}
 
-    cur.execute("""CREATE TABLE IF NOT EXISTS files(
-        id INTEGER PRIMARY KEY,
-        filename TEXT,
-        country TEXT)""")
-
-    cur.execute("""CREATE TABLE IF NOT EXISTS messages(
-        id INTEGER PRIMARY KEY,
-        content TEXT)""")
-
-    users = [
-        ("mohaymen","mohaymen","owner"),
-        ("selvaaapanell","selvaaapanell","admin"),
-        ("selvaaapanelll","selvaaapanelll","admin")
-    ]
-
-    for u in users:
-        cur.execute("SELECT id FROM users WHERE username=?", (u[0],))
-        if not cur.fetchone():
-            cur.execute("INSERT INTO users(username,password,role) VALUES (?,?,?)", u)
-
-    con.commit()
-    con.close()
-
-init_db()
-
-# ---------------- STYLE ----------------
-STYLE = """
+# ================== INTRO ==================
+INTRO = """
+<!DOCTYPE html>
+<html>
+<head>
+<title>SELVA</title>
 <style>
 body{
-background:url('https://i.ibb.co/m1jd1Hx/image.jpg') no-repeat center center fixed;
-background-size:cover;
-color:#0ff;
-font-family:Arial;
-margin:0;
+margin:0;height:100vh;background:url('https://i.ibb.co/m1jd1Hx/image.png') center/cover;
+display:flex;align-items:center;justify-content:center;color:white;font-family:Arial;
 }
-.overlay{
-background:rgba(0,0,0,0.8);
-min-height:100vh;
-padding:20px;
-}
-.glass{
-background:rgba(0,0,0,0.6);
-border-radius:15px;
-padding:20px;
-box-shadow:0 0 20px #0ff;
-margin:20px auto;
-max-width:500px;
-}
-input,button{
-width:100%;
-padding:12px;
-margin-top:10px;
-background:#000;
-border:1px solid #0ff;
-color:#0ff;
-border-radius:10px;
-}
-button{
-cursor:pointer;
-box-shadow:0 0 15px #0ff;
-}
-button:hover{
-background:#0ff;
-color:#000;
-}
-.card{
-border:1px solid #0ff;
-padding:10px;
-margin-top:10px;
-border-radius:10px;
-box-shadow:0 0 10px #0ff;
-}
-.topbar{
-display:flex;
-justify-content:space-between;
-align-items:center;
-}
-.menu{
-display:none;
-}
-.menu a{
-display:block;
-margin-top:10px;
-}
+.overlay{background:rgba(0,0,0,0.6);padding:60px;border-radius:20px;box-shadow:0 0 40px #38bdf8;text-align:center}
+.logo{width:180px;height:180px;border-radius:50%;background:url('https://i.ibb.co/m1jd1Hx/image.png') center/cover;margin:auto;box-shadow:0 0 30px #38bdf8}
+h1{margin-top:20px;letter-spacing:5px}
 </style>
 <script>
-function toggleMenu(){
-let m=document.getElementById('menu');
-m.style.display = m.style.display=='block'?'none':'block';
-}
+setTimeout(()=>{window.location='/login'},5000)
 </script>
+</head>
+<body>
+<div class="overlay">
+<div class="logo"></div>
+<h1>S E L V A Massage ⚡</h1>
+</div>
+</body>
+</html>
 """
 
-# ---------------- SPLASH ----------------
-@app.route("/")
-def splash():
-    return f"""
-    <html><head>
-    <meta http-equiv="refresh" content="5;url=/login">
-    {STYLE}
-    </head>
-    <body>
-    <div class="overlay" style="display:flex;align-items:center;justify-content:center">
-        <div align="center">
-            <h1>S E L V A Massage ⚡</h1>
-        </div>
-    </div>
-    </body></html>
-    """
+# ================== LOGIN ==================
+LOGIN = """
+<!DOCTYPE html>
+<html>
+<head><title>Login</title></head>
+<body style="background:#020617;color:white;font-family:Arial;text-align:center;padding-top:120px">
+<h2>Login</h2>
+<form method="post">
+<input name="username" placeholder="Username"><br><br>
+<input name="password" type="password" placeholder="Password"><br><br>
+<button>Login</button>
+</form>
+<br>
+<a href="https://t.me/selva_number" style="color:#38bdf8">Main channel</a>
+</body>
+</html>
+"""
 
-# ---------------- LOGIN ----------------
-@app.route("/login", methods=["GET","POST"])
+# ================== DASHBOARD ==================
+DASH = """
+<!DOCTYPE html>
+<html>
+<head><title>Dashboard</title></head>
+<body style="background:#020617;color:white;font-family:Arial;padding:20px">
+<h2>Welcome {{user}} ({{role}})</h2>
+
+<form method="get" action="/search">
+<input name="q" placeholder="Last 3 digits">
+<button>بحث</button>
+</form>
+
+<br>
+<a href="/files">My number file</a> |
+<a href="/numbers">My number</a> |
+<a href="/logout">Logout</a>
+
+{% if role in ['owner','admin'] %}
+<hr>
+<h3>Admin Panel</h3>
+<form method="post" action="/add_user">
+<input name="u" placeholder="Username">
+<input name="p" placeholder="Password">
+<button>Add User</button>
+</form>
+<br>
+<form method="post" enctype="multipart/form-data" action="/upload">
+<input type="file" name="file">
+<button>Upload File</button>
+</form>
+{% endif %}
+
+{% if role=='owner' %}
+<hr>
+<h3>All Users</h3>
+<ul>{% for u in users %}<li>{{u}}</li>{% endfor %}</ul>
+{% endif %}
+</body>
+</html>
+"""
+
+# ================== ROUTES ==================
+@app.route('/')
+def intro():
+    return render_template_string(INTRO)
+
+@app.route('/login', methods=['GET','POST'])
 def login():
-    if request.method=="POST":
-        u=request.form["username"]
-        p=request.form["password"]
+    if request.method=='POST':
+        u=request.form['username']; p=request.form['password']
+        if u in USERS and USERS[u]['password']==p:
+            session['user']=u
+            return redirect('/dashboard')
+    return render_template_string(LOGIN)
 
-        con=sqlite3.connect(DB)
-        cur=con.cursor()
-        cur.execute("SELECT role FROM users WHERE username=? AND password=?", (u,p))
-        r=cur.fetchone()
-        con.close()
-
-        if r:
-            session["user"]=u
-            session["role"]=r[0]
-            return redirect("/dashboard")
-
-    return f"""
-    <html><head>{STYLE}</head><body>
-    <div class="overlay">
-    <div class="glass">
-        <h2>Login</h2>
-        <form method="post">
-            <input name="username" placeholder="Username">
-            <input name="password" type="password" placeholder="Password">
-            <button>Login</button>
-        </form>
-        <br>
-        <a href="https://t.me/selva_number" target="_blank">Main channel</a>
-    </div>
-    </div>
-    </body></html>
-    """
-
-# ---------------- DASHBOARD ----------------
-@app.route("/dashboard", methods=["GET","POST"])
+@app.route('/dashboard')
 def dashboard():
-    if "user" not in session:
-        return redirect("/login")
+    if 'user' not in session: return redirect('/login')
+    u=session['user']
+    return render_template_string(DASH, user=u, role=USERS[u]['role'], users=USERS.keys())
 
-    con=sqlite3.connect(DB)
-    cur=con.cursor()
+@app.route('/add_user', methods=['POST'])
+def add_user():
+    u=session['user']
+    if USERS[u]['role'] in ['owner','admin']:
+        USERS[request.form['u']]={"password":request.form['p'],"role":"user"}
+    return redirect('/dashboard')
 
-    # search last 3 digits
-    result=""
-    if request.method=="POST" and "search" in request.form:
-        key=request.form["search"]
-        cur.execute("SELECT content FROM messages WHERE content LIKE ?",('%'+key,))
-        r=cur.fetchone()
-        result=r[0] if r else "No result"
+@app.route('/upload', methods=['POST'])
+def upload():
+    u=session['user']
+    if USERS[u]['role'] in ['owner','admin']:
+        f=request.files['file']
+        f.save(os.path.join(UPLOADS,f.filename))
+    return redirect('/dashboard')
 
-    # files
-    cur.execute("SELECT id,filename,country FROM files")
-    files=cur.fetchall()
+@app.route('/files')
+def files():
+    return "<br>".join([f"<a href='/download/{f}'>{f}</a>" for f in os.listdir(UPLOADS)])
 
-    # users (owner only)
-    cur.execute("SELECT id,username,role FROM users")
-    users=cur.fetchall()
-
-    con.close()
-
-    files_html=""
-    for f in files:
-        files_html+=f"""
-        <div class="card">
-        🌍 {f[2]}<br>
-        <a href="/download/{f[1]}">Download</a>
-        {"<a href='/delete_file/"+str(f[0])+"'> | Delete</a>" if session['role']=='owner' else ""}
-        </div>
-        """
-
-    users_html=""
-    if session["role"]=="owner":
-        for u in users:
-            users_html+=f"""
-            <div class="card">
-            {u[1]} ({u[2]})
-            <a href="/delete_user/{u[0]}">Delete</a>
-            </div>
-            """
-
-    return f"""
-    <html><head>{STYLE}</head><body>
-    <div class="overlay">
-
-    <div class="topbar">
-        <h3>Welcome {session['user']}</h3>
-        <button onclick="toggleMenu()">⚙️</button>
-    </div>
-
-    <div id="menu" class="glass menu">
-        <a href="/my_numbers">My number</a>
-        <a href="/files">My number file</a>
-    </div>
-
-    <div class="glass">
-        <form method="post">
-            <input name="search" placeholder="Last 3 digits">
-            <button>Search</button>
-        </form>
-        <p>{result}</p>
-    </div>
-
-    <div class="glass">
-        <h3>Files</h3>
-        {files_html}
-    </div>
-
-    {"<div class='glass'><h3>Users</h3>"+users_html+"</div>" if session['role']=='owner' else ""}
-
-    <div class="glass">
-        <a href="/logout">Logout</a>
-    </div>
-
-    </div>
-    </body></html>
-    """
-
-# ---------------- MY NUMBER (BY COUNTRY) ----------------
-@app.route("/my_numbers")
-def my_numbers():
-    con=sqlite3.connect(DB)
-    cur=con.cursor()
-    cur.execute("SELECT country,filename FROM files")
-    rows=cur.fetchall()
-    con.close()
-
-    data={}
-    for c,f in rows:
-        data.setdefault(c,[]).append(f)
-
-    html=""
-    for c,files in data.items():
-        html+=f"<h3>{c}</h3>"
-        for f in files:
-            path=os.path.join(UPLOAD_FOLDER,f)
-            if os.path.exists(path):
-                with open(path,errors="ignore") as file:
-                    for line in file:
-                        html+=f"<div class='card'>{line.strip()}</div>"
-
-    return f"<html><head>{STYLE}</head><body><div class='overlay'>{html}</div></body></html>"
-
-# ---------------- FILES PAGE ----------------
-@app.route("/files")
-def files_page():
-    con=sqlite3.connect(DB)
-    cur=con.cursor()
-    cur.execute("SELECT filename FROM files")
-    files=cur.fetchall()
-    con.close()
-
-    html=""
-    for f in files:
-        html+=f"<div class='card'><a href='/download/{f[0]}'>Download {f[0]}</a></div>"
-
-    return f"<html><head>{STYLE}</head><body><div class='overlay'>{html}</div></body></html>"
-
-# ---------------- DELETE ----------------
-@app.route("/delete_user/<int:id>")
-def delete_user(id):
-    if session.get("role")!="owner":
-        return redirect("/dashboard")
-    con=sqlite3.connect(DB)
-    cur=con.cursor()
-    cur.execute("DELETE FROM users WHERE id=?", (id,))
-    con.commit()
-    con.close()
-    return redirect("/dashboard")
-
-@app.route("/delete_file/<int:id>")
-def delete_file(id):
-    if session.get("role")!="owner":
-        return redirect("/dashboard")
-    con=sqlite3.connect(DB)
-    cur=con.cursor()
-    cur.execute("SELECT filename FROM files WHERE id=?", (id,))
-    f=cur.fetchone()
-    if f:
-        try: os.remove(os.path.join(UPLOAD_FOLDER,f[0]))
-        except: pass
-        cur.execute("DELETE FROM files WHERE id=?", (id,))
-    con.commit()
-    con.close()
-    return redirect("/dashboard")
-
-# ---------------- DOWNLOAD ----------------
-@app.route("/download/<name>")
+@app.route('/download/<name>')
 def download(name):
-    return send_from_directory(UPLOAD_FOLDER,name,as_attachment=True)
+    return send_from_directory(UPLOADS,name,as_attachment=True)
 
-# ---------------- LOGOUT ----------------
-@app.route("/logout")
+@app.route('/numbers')
+def numbers():
+    html="<h2>Countries</h2>"
+    for c in os.listdir(NUMBERS):
+        html+=f"<h3>{c}</h3><pre>{open(os.path.join(NUMBERS,c)).read()}</pre>"
+    return html
+
+@app.route('/search')
+def search():
+    q=request.args.get('q','')
+    res=[m['text'] for m in MESSAGES if m['last3']==q]
+    return '<br>'.join(res) if res else 'No results'
+
+@app.route('/logout')
 def logout():
-    session.clear()
-    return redirect("/login")
+    session.clear(); return redirect('/login')
 
-# ---------------- RUN ----------------
-if __name__=="__main__":
-    import os
-    port=int(os.environ.get("PORT",5000))
-    app.run(host="0.0.0.0",port=port)
+# ================== RUN ==================
+if __name__=='__main__':
+    app.run(host='0.0.0.0',port=5000)
