@@ -1,199 +1,498 @@
-# Selva Panel – Single File Full Script
-# Flask + Telethon + Multi Bot Groups (OTP Only)
-
+from flask import (
+    Flask, render_template_string, request,
+    redirect, url_for, send_from_directory, jsonify, flash
+)
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import (
+    LoginManager, UserMixin,
+    login_user, login_required,
+    logout_user, current_user
+)
 import os
 import re
-import sqlite3
-import threading
-import requests
 from datetime import datetime
-from flask import Flask, request, redirect, session, render_template_string, abort
-from telethon import TelegramClient, events
+import telethon
+from telethon.sync import TelegramClient
+from telethon.sessions import StringSession
+import threading
+import time
+import asyncio
+import base64
 
-# ================= CONFIG =================
-APP_ID = 39864754
-APP_HASH = "254da5354e8595342d963ef27049c772"
-CHANNEL_ID = -1003808609180
-SESSION_NAME = "ko"
-SECRET_KEY = "selva-secret"
-DB = "selva.db"
-UPLOAD_DIR = "uploads"
+# ================== CONFIG ==================
+app = Flask(__name__)
+app.secret_key = "SELVA_SUPER_SECRET"
 
-OWNER = {"username": "mohaymen", "password": "mohaymen"}
-ADMINS = {
-    "selvaaapanell": "selvaaapanell",
-    "selvaaapanelll": "selvaaapanelll"
+app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///database.db"
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["UPLOAD_FOLDER"] = "uploads"
+
+db = SQLAlchemy(app)
+login_manager = LoginManager(app)
+login_manager.login_view = "login"
+
+# =============== OWNER ACCOUNT ===============
+OWNER_USERNAME = "mohaymen"
+OWNER_PASSWORD = "mohaymenn"
+
+# =============== SPECIAL ACCOUNTS ===============
+SPECIAL_ACCOUNTS = {
+    "selvapanel1": {
+        "password": "selvapanel1",
+        "permissions": ["create_accounts"]
+    },
+    "selvapanel2": {
+        "password": "selvapanel2",
+        "permissions": ["create_accounts"]
+    }
 }
 
-# ================= INIT =================
-app = Flask(__name__)
-app.secret_key = SECRET_KEY
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# =============== TELEGRAM CONFIG ===============
+TELEGRAM_API_ID = 39864754
+TELEGRAM_API_HASH = "254da5354e8595342d963ef27049c772"
+TELEGRAM_CHANNEL_ID = -1003808609180
+TELEGRAM_SESSION = "ko"
 
-# ================= DB =================
-def db():
-    return sqlite3.connect(DB, check_same_thread=False)
+# Global variable for Telegram client
+telegram_client = None
+telegram_running = False
 
-def init_db():
-    c = db()
-    cur = c.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT, password TEXT, role TEXT)")
-    cur.execute("CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, content TEXT, last3 TEXT, created_at TEXT)")
-    cur.execute("CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY, country TEXT, filename TEXT, path TEXT)")
-    cur.execute("CREATE TABLE IF NOT EXISTS bot_links(id INTEGER PRIMARY KEY, user TEXT, bot_token TEXT)")
-    cur.execute("CREATE TABLE IF NOT EXISTS bot_groups(id INTEGER PRIMARY KEY, bot_id INTEGER, chat_id TEXT)")
+# ================== MODELS ==================
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(50), unique=True)
+    password = db.Column(db.String(100))
+    created_by = db.Column(db.String(50))
 
-    # owner
-    cur.execute("INSERT OR IGNORE INTO users(username,password,role) VALUES(?,?,?)",
-                (OWNER['username'], OWNER['password'], 'owner'))
-    # admins
-    for u, p in ADMINS.items():
-        cur.execute("INSERT OR IGNORE INTO users(username,password,role) VALUES(?,?,?)", (u, p, 'admin'))
-    c.commit()
+class NumberFile(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    country = db.Column(db.String(50))
+    filename = db.Column(db.String(200))
 
-init_db()
+class OTPMessage(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    message = db.Column(db.Text)
+    time = db.Column(db.String(50))
+    otp_code = db.Column(db.String(20))
+    phone_number = db.Column(db.String(50))
 
-# ================= AUTH =================
-def current_user():
-    return session.get("user")
+class TelegramBot(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    bot_token = db.Column(db.String(200))
+    group_id = db.Column(db.String(100))
+    created_by = db.Column(db.String(50))
+    created_at = db.Column(db.String(50))
+    status = db.Column(db.String(20), default="stopped")
 
-def role():
-    return session.get("role")
+# ================== LOGIN ==================
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
 
-# ================= OTP FILTER =================
-OTP_RE = re.compile(r"\b\d{4,8}\b")
+# ================== HELPER FUNCTIONS ==================
+def extract_numbers_from_file(file_path):
+    """Extract phone numbers from a file"""
+    numbers = []
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+            phone_pattern = r'(\+?\d[\d\s\-\(\)]{7,}\d)'
+            found_numbers = re.findall(phone_pattern, content)
+            numbers = [re.sub(r'\D', '', num) for num in found_numbers if len(re.sub(r'\D', '', num)) >= 10]
+    except Exception as e:
+        print(f"Error reading file: {e}")
+    return numbers
 
-def extract_otp(text):
-    m = OTP_RE.search(text)
-    return m.group(0) if m else None
+def extract_otp_from_message(message):
+    """Extract OTP code from message"""
+    otp_pattern = r'\b\d{4,8}\b'
+    matches = re.findall(otp_pattern, message)
+    return matches[0] if matches else None
 
-# ================= TELETHON =================
-client = TelegramClient(SESSION_NAME, APP_ID, APP_HASH)
+def extract_phone_from_message(message):
+    """Extract phone number from message"""
+    phone_pattern = r'(\+?\d[\d\s\-\(\)]{7,}\d)'
+    matches = re.findall(phone_pattern, message)
+    return matches[0] if matches else None
 
-@client.on(events.NewMessage(chats=CHANNEL_ID))
-async def handler(event):
-    text = event.raw_text
-    otp = extract_otp(text)
-    if not otp:
-        return
+async def telegram_listener():
+    """Listen to Telegram channel and extract OTP messages"""
+    global telegram_client, telegram_running
+    
+    try:
+        client = TelegramClient(StringSession(TELEGRAM_SESSION), 
+                               TELEGRAM_API_ID, TELEGRAM_API_HASH)
+        await client.start()
+        telegram_client = client
+        
+        entity = await client.get_entity(TELEGRAM_CHANNEL_ID)
+        
+        while telegram_running:
+            messages = await client.get_messages(entity, limit=10)
+            
+            for message in reversed(messages):
+                if message.text:
+                    existing = OTPMessage.query.filter_by(message=message.text).first()
+                    if not existing:
+                        otp_code = extract_otp_from_message(message.text)
+                        phone_number = extract_phone_from_message(message.text)
+                        
+                        db.session.add(OTPMessage(
+                            message=message.text,
+                            time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            otp_code=otp_code,
+                            phone_number=phone_number
+                        ))
+                        db.session.commit()
+            
+            await asyncio.sleep(5)
+            
+    except Exception as e:
+        print(f"Telegram error: {e}")
+        telegram_running = False
 
-    last3 = otp[-3:]
-    c = db()
-    cur = c.cursor()
-    cur.execute("INSERT INTO messages(content,last3,created_at) VALUES(?,?,?)",
-                (text, last3, datetime.utcnow().isoformat()))
-    c.commit()
+def run_telegram_listener():
+    """Run Telegram listener in background"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(telegram_listener())
 
-    # send to linked bots
-    cur.execute("SELECT id, bot_token FROM bot_links")
-    bots = cur.fetchall()
-    for bot_id, token in bots:
-        cur.execute("SELECT chat_id FROM bot_groups WHERE bot_id=?", (bot_id,))
-        groups = cur.fetchall()
-        for (chat_id,) in groups:
-            try:
-                requests.post(
-                    f"https://api.telegram.org/bot{token}/sendMessage",
-                    json={"chat_id": chat_id, "text": text}, timeout=5
-                )
-            except:
-                pass
+async def send_to_telegram_bot(bot_token, group_id, message):
+    """Send message to Telegram bot"""
+    try:
+        bot_client = TelegramClient(StringSession(f"bot_{bot_token[:10]}"), 
+                                   TELEGRAM_API_ID, TELEGRAM_API_HASH)
+        await bot_client.start(bot_token=bot_token)
+        
+        await bot_client.send_message(int(group_id), message)
+        await bot_client.disconnect()
+        return True
+    except Exception as e:
+        print(f"Bot sending error: {e}")
+        return False
 
-# ================= WEB =================
-HTML = """
-<!doctype html>
+# ================== HTML TEMPLATES ==================
+LOGIN_HTML = '''
+<!DOCTYPE html>
 <html>
 <head>
-<title>Selva Panel</title>
-<style>
-body{background:#0b0f19;color:#fff;font-family:sans-serif}
-.card{background:#111;padding:20px;margin:20px;border-radius:10px}
-input,button{padding:10px;margin:5px;border-radius:5px}
-</style>
+    <title>Login</title>
+    <style>
+        body { font-family: Arial; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); height: 100vh; display: flex; justify-content: center; align-items: center; margin: 0; }
+        .login-box { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); width: 300px; }
+        h2 { text-align: center; color: #333; margin-bottom: 30px; }
+        input { width: 100%; padding: 12px; margin: 10px 0; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; }
+        button { width: 100%; padding: 12px; background: #667eea; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; }
+        button:hover { background: #5a67d8; }
+        .error { color: red; text-align: center; margin-top: 10px; }
+    </style>
 </head>
 <body>
-{% if not user %}
-<div class=card>
-<h2>Login</h2>
-<form method=post>
-<input name=u placeholder=Username>
-<input name=p type=password placeholder=Password>
-<button>Login</button>
-</form>
-</div>
-{% else %}
-<div class=card>
-<h2>Search OTP</h2>
-<form method=get action=/search>
-<input name=q placeholder="Last 3 digits">
-<button>Search</button>
-</form>
-</div>
-
-<div class=card>
-<h3>Link Telegram Bot</h3>
-<form method=post action=/bot>
-<input name=token placeholder="Bot Token">
-<button>Save Bot</button>
-</form>
-<form method=post action=/group>
-<input name=chat placeholder="Chat ID">
-<button>Add Group</button>
-</form>
-</div>
-
-{% endif %}
+    <div class="login-box">
+        <h2>🔐 Login</h2>
+        <form method="POST">
+            <input type="text" name="username" placeholder="Username" required>
+            <input type="password" name="password" placeholder="Password" required>
+            <button type="submit">Login</button>
+        </form>
+        {% with messages = get_flashed_messages() %}
+            {% if messages %}
+                <div class="error">
+                    {% for message in messages %}
+                        {{ message }}
+                    {% endfor %}
+                </div>
+            {% endif %}
+        {% endwith %}
+    </div>
 </body>
 </html>
-"""
+'''
 
-@app.route('/', methods=['GET','POST'])
-def index():
-    if request.method == 'POST':
-        u = request.form['u']
-        p = request.form['p']
-        cur = db().cursor()
-        cur.execute("SELECT role FROM users WHERE username=? AND password=?", (u,p))
-        r = cur.fetchone()
-        if r:
-            session['user']=u
-            session['role']=r[0]
-            return redirect('/')
-    return render_template_string(HTML, user=current_user())
+ADMIN_HTML = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Admin Panel</title>
+    <style>
+        body { font-family: Arial; background: #f5f5f5; margin: 0; padding: 20px; }
+        .container { max-width: 1200px; margin: auto; }
+        .section { background: white; padding: 20px; margin: 20px 0; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h2, h3 { color: #333; border-bottom: 2px solid #667eea; padding-bottom: 10px; }
+        table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #f8f9fa; }
+        input, select { padding: 8px; margin: 5px; border: 1px solid #ddd; border-radius: 5px; }
+        button { padding: 8px 15px; background: #667eea; color: white; border: none; border-radius: 5px; cursor: pointer; margin: 5px; }
+        button:hover { background: #5a67d8; }
+        .btn-danger { background: #dc3545; }
+        .btn-danger:hover { background: #c82333; }
+        .btn-success { background: #28a745; }
+        .btn-success:hover { background: #218838; }
+        .logout { text-align: right; margin: 20px 0; }
+        .logout a { color: #dc3545; text-decoration: none; }
+        .flash-message { padding: 10px; margin: 10px 0; border-radius: 5px; }
+        .success { background: #d4edda; color: #155724; }
+        .error { background: #f8d7da; color: #721c24; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="logout">
+            <a href="/logout">Logout</a>
+        </div>
+        
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="flash-message {{ category }}">{{ message }}</div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+        
+        <div class="section">
+            <h2>👑 Admin Panel - Welcome {{ current_user.username }}</h2>
+        </div>
+        
+        <div class="section">
+            <h3>👤 Create User Account</h3>
+            <form method="POST">
+                <input type="text" name="new_username" placeholder="Username" required>
+                <input type="password" name="new_password" placeholder="Password" required>
+                <button type="submit" name="create_account" class="btn-success">Create Account</button>
+            </form>
+        </div>
+        
+        <div class="section">
+            <h3>🗑️ Delete User Account</h3>
+            <form method="POST">
+                <select name="user_id">
+                    {% for user in users %}
+                        {% if user.username != owner_username and user.username not in special_accounts %}
+                            <option value="{{ user.id }}">{{ user.username }}</option>
+                        {% endif %}
+                    {% endfor %}
+                </select>
+                <button type="submit" name="delete_account" class="btn-danger">Delete Account</button>
+            </form>
+        </div>
+        
+        <div class="section">
+            <h3>📁 Upload Number File</h3>
+            <form method="POST" enctype="multipart/form-data">
+                <input type="text" name="country" placeholder="Country" required>
+                <input type="file" name="file" required>
+                <button type="submit" name="upload_file" class="btn-success">Upload File</button>
+            </form>
+        </div>
+        
+        <div class="section">
+            <h3>📋 Files List</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Country</th>
+                        <th>Filename</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for file in files %}
+                    <tr>
+                        <td>{{ file.id }}</td>
+                        <td>{{ file.country }}</td>
+                        <td>{{ file.filename }}</td>
+                        <td>
+                            <form method="POST" style="display: inline;">
+                                <input type="hidden" name="file_id" value="{{ file.id }}">
+                                <button type="submit" name="delete_file" class="btn-danger">Delete</button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% if files %}
+            <form method="POST">
+                <button type="submit" name="delete_all" class="btn-danger">Delete All Files</button>
+            </form>
+            {% endif %}
+        </div>
+        
+        <div class="section">
+            <h3>👥 Users List</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Username</th>
+                        <th>Created By</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for user in users %}
+                    <tr>
+                        <td>{{ user.id }}</td>
+                        <td>{{ user.username }}</td>
+                        <td>{{ user.created_by if user.created_by else 'System' }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</body>
+</html>
+'''
 
-@app.route('/search')
-def search():
-    q = request.args.get('q','')
-    cur = db().cursor()
-    cur.execute("SELECT content FROM messages WHERE last3=? ORDER BY id DESC LIMIT 10", (q,))
-    return '<br>'.join([m[0] for m in cur.fetchall()])
+DASHBOARD_HTML = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dashboard</title>
+    <style>
+        body { font-family: Arial; background: #f5f5f5; margin: 0; padding: 20px; }
+        .container { max-width: 1200px; margin: auto; }
+        .header { background: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .section { background: white; padding: 20px; margin: 20px 0; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h2 { color: #333; border-bottom: 2px solid #667eea; padding-bottom: 10px; }
+        .file-list, .otp-list { margin: 15px 0; }
+        .file-item, .otp-item { padding: 10px; border: 1px solid #ddd; margin: 5px 0; border-radius: 5px; }
+        .download-btn { background: #4CAF50; color: white; padding: 5px 10px; text-decoration: none; border-radius: 3px; }
+        .logout { text-align: right; }
+        .logout a { color: #dc3545; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="logout">
+                <a href="/logout">Logout</a>
+            </div>
+            <h2>📊 Dashboard - Welcome {{ current_user.username }}</h2>
+        </div>
+        
+        <div class="section">
+            <h3>📁 Available Files</h3>
+            <div class="file-list">
+                {% if files %}
+                    {% for file in files %}
+                    <div class="file-item">
+                        <strong>{{ file.filename }}</strong> ({{ file.country }})
+                        <a href="/download/{{ file.filename }}" class="download-btn">Download</a>
+                    </div>
+                    {% endfor %}
+                {% else %}
+                    <p>No files available.</p>
+                {% endif %}
+            </div>
+        </div>
+        
+        <div class="section">
+            <h3>📨 Recent OTP Messages</h3>
+            <div class="otp-list">
+                {% if otps %}
+                    {% for otp in otps %}
+                    <div class="otp-item">
+                        <div><strong>Time:</strong> {{ otp.time }}</div>
+                        <div><strong>OTP:</strong> {{ otp.otp_code if otp.otp_code else 'N/A' }}</div>
+                        <div><strong>Phone:</strong> {{ otp.phone_number if otp.phone_number else 'N/A' }}</div>
+                        <div>{{ otp.message }}</div>
+                    </div>
+                    {% endfor %}
+                {% else %}
+                    <p>No OTP messages received yet.</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+'''
 
-@app.route('/bot', methods=['POST'])
-def bot():
-    if not current_user(): abort(403)
-    token = request.form['token']
-    c=db();cur=c.cursor()
-    cur.execute("DELETE FROM bot_links WHERE user=?", (current_user(),))
-    cur.execute("INSERT INTO bot_links(user,bot_token) VALUES(?,?)", (current_user(),token))
-    c.commit()
-    return redirect('/')
+SETTINGS_HTML = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Settings Panel</title>
+    <style>
+        body { font-family: Arial; background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); min-height: 100vh; margin: 0; padding: 20px; }
+        .container { max-width: 800px; margin: auto; }
+        .settings-menu { background: white; padding: 30px; border-radius: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); }
+        .welcome { text-align: center; margin-bottom: 30px; }
+        .menu-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+        .menu-item { background: #f8f9fa; padding: 25px; border-radius: 10px; text-align: center; border: 2px solid transparent; transition: all 0.3s; cursor: pointer; }
+        .menu-item:hover { border-color: #667eea; transform: translateY(-5px); box-shadow: 0 5px 15px rgba(0,0,0,0.1); }
+        .menu-item a { text-decoration: none; color: #333; display: block; }
+        .menu-icon { font-size: 40px; margin-bottom: 15px; }
+        .menu-title { font-size: 20px; font-weight: bold; margin-bottom: 10px; }
+        .menu-desc { color: #666; font-size: 14px; }
+        .logout { text-align: center; margin-top: 30px; }
+        .logout a { color: #dc3545; text-decoration: none; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="settings-menu">
+            <div class="welcome">
+                <h1>⚙️ Settings Panel</h1>
+                <p>Welcome, <strong>{{ current_user.username }}</strong></p>
+            </div>
+            
+            <div class="menu-grid">
+                <div class="menu-item" onclick="window.location.href='/my_numbers'">
+                    <div class="menu-icon">📱</div>
+                    <div class="menu-title">My Numbers</div>
+                    <div class="menu-desc">Extract and view phone numbers from files</div>
+                </div>
+                
+                <div class="menu-item" onclick="window.location.href='/my_number_files'">
+                    <div class="menu-icon">📁</div>
+                    <div class="menu-title">My Number Files</div>
+                    <div class="menu-desc">Manage and download number files</div>
+                </div>
+                
+                <div class="menu-item" onclick="window.location.href='/my_otp'">
+                    <div class="menu-icon">📨</div>
+                    <div class="menu-title">My OTP</div>
+                    <div class="menu-desc">Telegram OTP listener and messages</div>
+                </div>
+                
+                <div class="menu-item" onclick="window.location.href='/create_bot'">
+                    <div class="menu-icon">🤖</div>
+                    <div class="menu-title">Create Bot</div>
+                    <div class="menu-desc">Create Telegram bot for OTP forwarding</div>
+                </div>
+                
+                <div class="menu-item" onclick="window.location.href='/create_user'">
+                    <div class="menu-icon">👤</div>
+                    <div class="menu-title">Create User</div>
+                    <div class="menu-desc">Create new user accounts</div>
+                </div>
+            </div>
+            
+            <div class="logout">
+                <a href="/logout">Logout</a>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+'''
 
-@app.route('/group', methods=['POST'])
-def group():
-    if not current_user(): abort(403)
-    chat = request.form['chat']
-    cur=db().cursor()
-    cur.execute("SELECT id FROM bot_links WHERE user=?", (current_user(),))
-    bot=cur.fetchone()
-    if bot:
-        cur.execute("INSERT INTO bot_groups(bot_id,chat_id) VALUES(?,?)", (bot[0],chat))
-        db().commit()
-    return redirect('/')
-
-# ================= RUN =================
-def run_web():
-    app.run('0.0.0.0',5000)
-
-threading.Thread(target=run_web).start()
-client.start()
-client.run_until_disconnected()
+MY_NUMBERS_HTML = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>My Numbers</title>
+    <style>
+        body { font-family: Arial; background: #f5f5f5; margin: 0; padding: 20px; }
+        .container { max-width: 1200px; margin: auto; }
+        .header { background: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .back-btn { background: #6c757d; color: white; padding: 8px 15px; text-decoration: none; border-radius: 5px; display: inline-block; margin-bottom: 20px; }
+        .country-section { background: white; padding: 20px; margin: 20px 0; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .numbers-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; margin-top: 15px; }
+        .number-item { background: #e9ecef; padding: 10px; border-radius: 5px; font-family: monospace; }
+        .country-header { display: flex; justify-content: space-between; align-items: center; }
+        .count
