@@ -11,8 +11,8 @@ from flask import Flask, request, redirect, session, render_template_string, abo
 from telethon import TelegramClient, events
 
 # ================= CONFIG =================
-APP_ID = 38460443
-APP_HASH = "5ee35420f38f9fe6915f3606fb353fb9"
+APP_ID = 39864754
+APP_HASH = "254da5354e8595342d963ef27049c772"
 CHANNEL_ID = -1003808609180
 SESSION_NAME = "ko"
 SECRET_KEY = "selva-secret"
