@@ -1,180 +1,199 @@
-# ================== SELVA PANEL – FULL WEBSITE ==================
-# Flask single-file project
-# Features:
-# Intro (5s) – Login – Roles (Owner/Admin/User)
-# Search by last 3 digits – File manager – Numbers by country
-# Telethon script is NOT included (as requested)
+# Selva Panel – Single File Full Script
+# Flask + Telethon + Multi Bot Groups (OTP Only)
 
-from flask import Flask, request, redirect, url_for, session, render_template_string, send_from_directory
 import os
+import re
+import sqlite3
+import threading
+import requests
+from datetime import datetime
+from flask import Flask, request, redirect, session, render_template_string, abort
+from telethon import TelegramClient, events
 
-app = Flask(__name__)
-app.secret_key = "SELVA_SECRET_KEY"
+# ================= CONFIG =================
+APP_ID = 38460443
+APP_HASH = "5ee35420f38f9fe6915f3606fb353fb9"
+CHANNEL_ID = -1003808609180
+SESSION_NAME = "ko"
+SECRET_KEY = "selva-secret"
+DB = "selva.db"
+UPLOAD_DIR = "uploads"
 
-# ================== USERS ==================
-USERS = {
-    "mohaymen": {"password": "mohaymen", "role": "owner"},
-    "selvaaapanell": {"password": "selvaaapanell", "role": "admin"},
-    "selvaaapanelll": {"password": "selvaaapanelll", "role": "admin"},
+OWNER = {"username": "mohaymen", "password": "mohaymen"}
+ADMINS = {
+    "selvaaapanell": "selvaaapanell",
+    "selvaaapanelll": "selvaaapanelll"
 }
 
-# ================== STORAGE ==================
-BASE_DIR = os.path.dirname(__file__)
-UPLOADS = os.path.join(BASE_DIR, "uploads")
-NUMBERS = os.path.join(BASE_DIR, "numbers")
-os.makedirs(UPLOADS, exist_ok=True)
-os.makedirs(NUMBERS, exist_ok=True)
+# ================= INIT =================
+app = Flask(__name__)
+app.secret_key = SECRET_KEY
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-MESSAGES = []  # example: {"text": "Your OTP is 123", "last3": "123"}
+# ================= DB =================
+def db():
+    return sqlite3.connect(DB, check_same_thread=False)
 
-# ================== INTRO ==================
-INTRO = """
-<!DOCTYPE html>
+def init_db():
+    c = db()
+    cur = c.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT, password TEXT, role TEXT)")
+    cur.execute("CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, content TEXT, last3 TEXT, created_at TEXT)")
+    cur.execute("CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY, country TEXT, filename TEXT, path TEXT)")
+    cur.execute("CREATE TABLE IF NOT EXISTS bot_links(id INTEGER PRIMARY KEY, user TEXT, bot_token TEXT)")
+    cur.execute("CREATE TABLE IF NOT EXISTS bot_groups(id INTEGER PRIMARY KEY, bot_id INTEGER, chat_id TEXT)")
+
+    # owner
+    cur.execute("INSERT OR IGNORE INTO users(username,password,role) VALUES(?,?,?)",
+                (OWNER['username'], OWNER['password'], 'owner'))
+    # admins
+    for u, p in ADMINS.items():
+        cur.execute("INSERT OR IGNORE INTO users(username,password,role) VALUES(?,?,?)", (u, p, 'admin'))
+    c.commit()
+
+init_db()
+
+# ================= AUTH =================
+def current_user():
+    return session.get("user")
+
+def role():
+    return session.get("role")
+
+# ================= OTP FILTER =================
+OTP_RE = re.compile(r"\b\d{4,8}\b")
+
+def extract_otp(text):
+    m = OTP_RE.search(text)
+    return m.group(0) if m else None
+
+# ================= TELETHON =================
+client = TelegramClient(SESSION_NAME, APP_ID, APP_HASH)
+
+@client.on(events.NewMessage(chats=CHANNEL_ID))
+async def handler(event):
+    text = event.raw_text
+    otp = extract_otp(text)
+    if not otp:
+        return
+
+    last3 = otp[-3:]
+    c = db()
+    cur = c.cursor()
+    cur.execute("INSERT INTO messages(content,last3,created_at) VALUES(?,?,?)",
+                (text, last3, datetime.utcnow().isoformat()))
+    c.commit()
+
+    # send to linked bots
+    cur.execute("SELECT id, bot_token FROM bot_links")
+    bots = cur.fetchall()
+    for bot_id, token in bots:
+        cur.execute("SELECT chat_id FROM bot_groups WHERE bot_id=?", (bot_id,))
+        groups = cur.fetchall()
+        for (chat_id,) in groups:
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json={"chat_id": chat_id, "text": text}, timeout=5
+                )
+            except:
+                pass
+
+# ================= WEB =================
+HTML = """
+<!doctype html>
 <html>
 <head>
-<title>SELVA</title>
+<title>Selva Panel</title>
 <style>
-body{
-margin:0;height:100vh;background:url('https://i.ibb.co/m1jd1Hx/image.png') center/cover;
-display:flex;align-items:center;justify-content:center;color:white;font-family:Arial;
-}
-.overlay{background:rgba(0,0,0,0.6);padding:60px;border-radius:20px;box-shadow:0 0 40px #38bdf8;text-align:center}
-.logo{width:180px;height:180px;border-radius:50%;background:url('https://i.ibb.co/m1jd1Hx/image.png') center/cover;margin:auto;box-shadow:0 0 30px #38bdf8}
-h1{margin-top:20px;letter-spacing:5px}
+body{background:#0b0f19;color:#fff;font-family:sans-serif}
+.card{background:#111;padding:20px;margin:20px;border-radius:10px}
+input,button{padding:10px;margin:5px;border-radius:5px}
 </style>
-<script>
-setTimeout(()=>{window.location='/login'},5000)
-</script>
 </head>
 <body>
-<div class="overlay">
-<div class="logo"></div>
-<h1>S E L V A Massage ⚡</h1>
-</div>
-</body>
-</html>
-"""
-
-# ================== LOGIN ==================
-LOGIN = """
-<!DOCTYPE html>
-<html>
-<head><title>Login</title></head>
-<body style="background:#020617;color:white;font-family:Arial;text-align:center;padding-top:120px">
+{% if not user %}
+<div class=card>
 <h2>Login</h2>
-<form method="post">
-<input name="username" placeholder="Username"><br><br>
-<input name="password" type="password" placeholder="Password"><br><br>
+<form method=post>
+<input name=u placeholder=Username>
+<input name=p type=password placeholder=Password>
 <button>Login</button>
 </form>
-<br>
-<a href="https://t.me/selva_number" style="color:#38bdf8">Main channel</a>
-</body>
-</html>
-"""
-
-# ================== DASHBOARD ==================
-DASH = """
-<!DOCTYPE html>
-<html>
-<head><title>Dashboard</title></head>
-<body style="background:#020617;color:white;font-family:Arial;padding:20px">
-<h2>Welcome {{user}} ({{role}})</h2>
-
-<form method="get" action="/search">
-<input name="q" placeholder="Last 3 digits">
-<button>بحث</button>
+</div>
+{% else %}
+<div class=card>
+<h2>Search OTP</h2>
+<form method=get action=/search>
+<input name=q placeholder="Last 3 digits">
+<button>Search</button>
 </form>
+</div>
 
-<br>
-<a href="/files">My number file</a> |
-<a href="/numbers">My number</a> |
-<a href="/logout">Logout</a>
-
-{% if role in ['owner','admin'] %}
-<hr>
-<h3>Admin Panel</h3>
-<form method="post" action="/add_user">
-<input name="u" placeholder="Username">
-<input name="p" placeholder="Password">
-<button>Add User</button>
+<div class=card>
+<h3>Link Telegram Bot</h3>
+<form method=post action=/bot>
+<input name=token placeholder="Bot Token">
+<button>Save Bot</button>
 </form>
-<br>
-<form method="post" enctype="multipart/form-data" action="/upload">
-<input type="file" name="file">
-<button>Upload File</button>
+<form method=post action=/group>
+<input name=chat placeholder="Chat ID">
+<button>Add Group</button>
 </form>
-{% endif %}
+</div>
 
-{% if role=='owner' %}
-<hr>
-<h3>All Users</h3>
-<ul>{% for u in users %}<li>{{u}}</li>{% endfor %}</ul>
 {% endif %}
 </body>
 </html>
 """
 
-# ================== ROUTES ==================
-@app.route('/')
-def intro():
-    return render_template_string(INTRO)
-
-@app.route('/login', methods=['GET','POST'])
-def login():
-    if request.method=='POST':
-        u=request.form['username']; p=request.form['password']
-        if u in USERS and USERS[u]['password']==p:
+@app.route('/', methods=['GET','POST'])
+def index():
+    if request.method == 'POST':
+        u = request.form['u']
+        p = request.form['p']
+        cur = db().cursor()
+        cur.execute("SELECT role FROM users WHERE username=? AND password=?", (u,p))
+        r = cur.fetchone()
+        if r:
             session['user']=u
-            return redirect('/dashboard')
-    return render_template_string(LOGIN)
-
-@app.route('/dashboard')
-def dashboard():
-    if 'user' not in session: return redirect('/login')
-    u=session['user']
-    return render_template_string(DASH, user=u, role=USERS[u]['role'], users=USERS.keys())
-
-@app.route('/add_user', methods=['POST'])
-def add_user():
-    u=session['user']
-    if USERS[u]['role'] in ['owner','admin']:
-        USERS[request.form['u']]={"password":request.form['p'],"role":"user"}
-    return redirect('/dashboard')
-
-@app.route('/upload', methods=['POST'])
-def upload():
-    u=session['user']
-    if USERS[u]['role'] in ['owner','admin']:
-        f=request.files['file']
-        f.save(os.path.join(UPLOADS,f.filename))
-    return redirect('/dashboard')
-
-@app.route('/files')
-def files():
-    return "<br>".join([f"<a href='/download/{f}'>{f}</a>" for f in os.listdir(UPLOADS)])
-
-@app.route('/download/<name>')
-def download(name):
-    return send_from_directory(UPLOADS,name,as_attachment=True)
-
-@app.route('/numbers')
-def numbers():
-    html="<h2>Countries</h2>"
-    for c in os.listdir(NUMBERS):
-        html+=f"<h3>{c}</h3><pre>{open(os.path.join(NUMBERS,c)).read()}</pre>"
-    return html
+            session['role']=r[0]
+            return redirect('/')
+    return render_template_string(HTML, user=current_user())
 
 @app.route('/search')
 def search():
-    q=request.args.get('q','')
-    res=[m['text'] for m in MESSAGES if m['last3']==q]
-    return '<br>'.join(res) if res else 'No results'
+    q = request.args.get('q','')
+    cur = db().cursor()
+    cur.execute("SELECT content FROM messages WHERE last3=? ORDER BY id DESC LIMIT 10", (q,))
+    return '<br>'.join([m[0] for m in cur.fetchall()])
 
-@app.route('/logout')
-def logout():
-    session.clear(); return redirect('/login')
+@app.route('/bot', methods=['POST'])
+def bot():
+    if not current_user(): abort(403)
+    token = request.form['token']
+    c=db();cur=c.cursor()
+    cur.execute("DELETE FROM bot_links WHERE user=?", (current_user(),))
+    cur.execute("INSERT INTO bot_links(user,bot_token) VALUES(?,?)", (current_user(),token))
+    c.commit()
+    return redirect('/')
 
-# ================== RUN ==================
-if __name__=='__main__':
-    app.run(host='0.0.0.0',port=5000)
+@app.route('/group', methods=['POST'])
+def group():
+    if not current_user(): abort(403)
+    chat = request.form['chat']
+    cur=db().cursor()
+    cur.execute("SELECT id FROM bot_links WHERE user=?", (current_user(),))
+    bot=cur.fetchone()
+    if bot:
+        cur.execute("INSERT INTO bot_groups(bot_id,chat_id) VALUES(?,?)", (bot[0],chat))
+        db().commit()
+    return redirect('/')
+
+# ================= RUN =================
+def run_web():
+    app.run('0.0.0.0',5000)
+
+threading.Thread(target=run_web).start()
+client.start()
+client.run_until_disconnected()
